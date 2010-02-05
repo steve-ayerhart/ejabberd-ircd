@@ -32,11 +32,16 @@
 		access,
 		encoding,
 		shaper,
+		webirc,
 		host,
 		muc_host,
 		sid = none,
 		pass = "",
+		% this is the nickname seen in the channels 
 		nick = none,
+		% this is the username used for generating the jabber ID 
+		% this is initially the same as the Nickname seen in the channels
+		jidnick = none,
 		user = none,
 		%% joining is a mapping from room JIDs to nicknames
 		%% received but not yet forwarded
@@ -80,7 +85,7 @@ socket_type() ->
 %% Returns: {ok, StateName, StateData}          |
 %%          {ok, StateName, StateData, Timeout} |
 %%          ignore                              |
-%%          {stop, StopReason}                   
+%%          {stop, StopReason}
 %%----------------------------------------------------------------------
 init([{SockMod, Socket}, Opts]) ->
     iconv:start(),
@@ -92,6 +97,10 @@ init([{SockMod, Socket}, Opts]) ->
 		 {value, {_, S}} -> S;
 		 _ -> none
 	     end,
+    WebIrc = case lists:keysearch(webirc, 1, Opts) of
+	       {value, {_, W}} -> W;
+	       _ -> none
+	   end,
     Host = case lists:keysearch(host, 1, Opts) of
 	       {value, {_, H}} -> H;
 	       _ -> ?MYNAME
@@ -126,6 +135,7 @@ init([{SockMod, Socket}, Opts]) ->
 			       access    = Access,
 			       encoding  = Encoding,
 			       shaper    = Shaper,
+			       webirc    = WebIrc,
 			       host      = Host,
 			       muc_host  = MucHost,
 			       channels_to_jids = ChannelToJid,
@@ -155,9 +165,9 @@ handle_event(_Event, StateName, StateData) ->
 code_change(_OldVsn, StateName, StateData, _Extra) ->
     {ok, StateName, StateData}.
 terminate(_Reason, _StateName, #state{socket = Socket, sockmod = SockMod,
-				      sid = SID, host = Host, nick = Nick,
+				      sid = SID, host = Host, jidnick = JidNick,
 				      joined = JoinedDict} = State) ->
-    ?INFO_MSG("closing IRC connection for ~p", [Nick]),
+    ?INFO_MSG("closing IRC connection for ~p", [JidNick]),
     case SID of
 	none ->
 	    ok;
@@ -168,13 +178,23 @@ terminate(_Reason, _StateName, #state{socket = Socket, sockmod = SockMod,
 	    ?DICT:map(fun(ChannelJID, _ChannelData) ->
 			      ejabberd_router:route(FromJID, ChannelJID, Packet)
 		      end, JoinedDict),
-	    ejabberd_sm:close_session_unset_presence(SID, Nick, Host, "irc", "Logged out")
+	    ejabberd_sm:close_session_unset_presence(SID, JidNick, Host, "irc", "Logged out")
     end,
     gen_tcp = SockMod,
     ok = gen_tcp:close(Socket),
     ok.
 
-    
+
+wait_for_nick({line, #line{command = "WEBIRC", params = [Password, _, _, _]}}, State) ->
+    ?DEBUG("in wait_for_nick", []),
+    ?DEBUG("got webirc pass ~p", [Password]),
+    if
+	Password==State#state.webirc -> 
+		{next_state, wait_for_nick, State};
+	true -> 
+    		send_reply('ERR_NOTONCHANNEL', ["You're not on that channel"], State),
+		{stop, normal, State}
+    end;
 wait_for_nick({line, #line{command = "PASS", params = Params}}, State) ->
     ?DEBUG("in wait_for_nick", []),
     Pass = hd(Params),
@@ -217,7 +237,7 @@ wait_for_nick({line, #line{command = "NICK", params = Params}}, State) ->
 			    send_reply('RPL_MOTD', [Nick, "- This IRC interface is quite immature.  You will probably find bugs."], State),
 			    send_reply('RPL_MOTD', [Nick, "- Have a good time!"], State),
 			    send_reply('RPL_ENDOFMOTD', [Nick, "End of /MOTD command"], State),
-			    {next_state, wait_for_cmd, State#state{nick = Nick, sid = SID, pass = ""}}
+			    {next_state, wait_for_cmd, State#state{nick = Nick, jidnick = Nick, sid = SID, pass = ""}}
 		    end
 	    end
     end;
@@ -252,12 +272,54 @@ wait_for_cmd({line, #line{command = "JOIN", params = Params}}, State) ->
     NewState = join_channels(Channels, Keys, State),
     {next_state, wait_for_cmd, NewState};
 
+wait_for_cmd({line, #line{command = "NAMES", params = [ChannelsString]}}, State) ->
+    ?DEBUG("in wait_for_cmd NAMES ~p", [ChannelsString]),
+    reply_names(string:tokens(ChannelsString, ","), State),
+    {next_state, wait_for_cmd, State};
+
+wait_for_cmd({line, #line{command = "LIST", params = _}}, State) ->
+    ?DEBUG("in wait_for_cmd LIST", []),
+    send_reply('RPL_LISTSTART', [State#state.nick, "Start of Channels list"], State),
+    lists:foreach(
+    fun(Channel) ->
+    	send_reply('RPL_LIST', [State#state.nick, "#"++Channel], State)
+    end, ?DICT:fetch_keys(State#state.channels_to_jids)),
+    send_reply('RPL_LISTEND', [State#state.nick, "End of Channels list"], State),
+    {next_state, wait_for_cmd, State};
+
+wait_for_cmd({line, #line{command = "NICK", params = [NewNick]}}, State) ->
+    Nick = State#state.nick,
+    ?DEBUG("in wait_for_cmd ~p changes nick to ~p", [Nick, NewNick]),
+    case NewNick of
+	Nick -> ""; 
+	_ ->
+    		send_text_command(Nick, "NICK", [NewNick], State),
+    		?DICT:fold(
+			fun(Channel, _, AccIn) -> Packet =
+				{xmlelement, "presence", [],
+		   			[{xmlelement, "priority", [], [1]}]
+				}, 
+				From=user_jid(State),
+				To=jlib:jid_replace_resource(Channel, NewNick),
+    				ejabberd_router:route(From, To, Packet),
+				AccIn
+			end, "", State#state.joined)
+	end,
+    {next_state, wait_for_cmd, State#state{nick=NewNick}};
+
 wait_for_cmd({line, #line{command = "PART", params = [ChannelsString | MaybeMessage]}}, State) ->
     Message = case MaybeMessage of
 		  [] -> nothing;
 		  [M] -> M
 	      end,
     Channels = string:tokens(ChannelsString, ","),
+    	lists:foreach(
+		fun(Channel) ->
+			% generates something like nick!nick@#chatroom
+    			IRCSender = make_irc_sender(State#state.nick, channel_to_jid(Channel, State), State),
+	   		send_command(IRCSender, "PART", [Channel], State)
+		end, Channels
+	),
     NewState = part_channels(Channels, State, Message),
     {next_state, wait_for_cmd, NewState};
 
@@ -317,7 +379,7 @@ wait_for_cmd({line, #line{command = "TOPIC", params = Params}}, State) ->
     case Params of
 	[Channel] ->
 	    %% user asks for topic
-	    case ?DICT:find(channel_to_jid(Channel, State), 
+	    case ?DICT:find(channel_to_jid(Channel, State),
 			    State#state.joined) of
 		{ok, #channel{topic = Topic}} ->
 		    case Topic of
@@ -386,18 +448,30 @@ wait_for_cmd({line, #line{command = Unknown, params = Params} = Line}, State) ->
     {next_state, wait_for_cmd, State};
 
 wait_for_cmd({route, From, _To, {xmlelement, "presence", Attrs, Els} = El}, State) ->
+    % type can get "error"  or ""
     Type = xml:get_attr_s("type", Attrs),
+    % FromRoom is chatroom@conference.example.net as jabber id
     FromRoom = jlib:jid_remove_resource(From),
+    % The Nickname 
     FromNick = From#jid.resource,
     
+    % returns the channel "#chatrom"
     Channel = jid_to_channel(From, State),
+    % this is my current nick or the one I want to have
     MyNick = State#state.nick,
+    % generates something like nick!nick@#chatroom
     IRCSender = make_irc_sender(FromNick, FromRoom, State),
 
+    % some debug code
+    %send_reply('RPL_MOTD', [MyNick, "Got Presence "++FromNick++"."], State),
+
+    % make a dict find for the channel in state joining 
     Joining = ?DICT:find(FromRoom, State#state.joining),
+    % and in state joined
     Joined = ?DICT:find(FromRoom, State#state.joined),
     case {Joining, Joined, Type} of
-	{{ok, BufferedNicks}, _, ""} ->
+	{{ok, ChannelData}, _, ""} ->
+	   BufferedNicks=ChannelData#channel.participants,
 	    case BufferedNicks of
 		[] ->
 		    %% If this is the first presence, tell the
@@ -407,56 +481,51 @@ wait_for_cmd({route, From, _To, {xmlelement, "presence", Attrs, Els} = El}, Stat
 		_ ->
 		    ok
 	    end,
-
+	    
+	    % NewRole enthält /presence/x/item@role but sometimes ""
 	    NewRole = case find_el("x", ?NS_MUC_USER, Els) of
 			  nothing ->
 			      "";
 			  XMucEl ->
 			      xml:get_path_s(XMucEl, [{elem, "item"}, {attr, "role"}])
 		      end,
-	    NewBufferedNicks = [{FromNick, NewRole} | BufferedNicks],
+	    
+	    %attach the user with the role to our BufferedNicks list
+	    % but only if the presence has a role 
+	    NewBufferedNicks = case NewRole of 
+		"" -> BufferedNicks;
+		_ -> [{FromNick, NewRole} | BufferedNicks]
+	    end,
 	    ?DEBUG("~s is present in ~s.  we now have ~p.",
-		   [FromNick, Channel, NewBufferedNicks]),
+		   		[FromNick, Channel, NewBufferedNicks]),
 	    %% We receive our own presence last.  XXX: there
 	    %% are some status codes here.  See XEP-0045,
 	    %% section 7.1.3.
 	    NewState =
-		case FromNick of
-		    MyNick ->
-			send_reply('RPL_NAMREPLY',
-				   [MyNick, "=",
-				    Channel,
-				    lists:append(
-				      lists:map(
-					fun({Nick, Role}) ->
-						case Role of
-						    "moderator" ->
-							"@";
-						    "participant" ->
-							"+";
-						    _ ->
-							""
-						end ++ Nick ++ " "
-					end, NewBufferedNicks))],
-				   State),
-			send_reply('RPL_ENDOFNAMES',
-				   [Channel,
-				    "End of /NAMES list"],
-				   State),
+		case {FromNick, NewRole} of
+		    % this is a presence without a role we have to do nothing yet 
+		   {MyNick, ""} -> State;
+		    {MyNick, _} ->
 			NewJoiningDict = ?DICT:erase(FromRoom, State#state.joining),
-			ChannelData = #channel{participants = NewBufferedNicks},
-			NewJoinedDict = ?DICT:store(FromRoom, ChannelData, State#state.joined),
-			State#state{joining = NewJoiningDict,
-				    joined = NewJoinedDict};
-		    _ ->
-			NewJoining = ?DICT:store(FromRoom, NewBufferedNicks, State#state.joining),
+			NewChannelData = #channel{participants = NewBufferedNicks},
+			NewJoinedDict = ?DICT:store(FromRoom, NewChannelData, State#state.joined),
+			MyState=State#state{joining = NewJoiningDict,
+                                    joined = NewJoinedDict},
+		        reply_names(Channel, NewChannelData, MyState),
+			MyState;
+		    {_, _} ->
+			% there iss a nick joining a channel, or a nick who is present in a channel 
+                        % we have to make an entry  
+			NewJoining = ?DICT:store(FromRoom, #channel{participants = NewBufferedNicks}, State#state.joining),
 			State#state{joining = NewJoining}
 		end,
 	    {next_state, wait_for_cmd, NewState};
-	{{ok, _BufferedNicks}, _, "error"} ->
+	{{ok, _ChannelData}, _, "error"} ->
+	   %BufferedNicks=ChannelData#channel.participants,
 	    NewState =
 		case FromNick of
 		    MyNick ->
+    			send_reply('RPL_MOTD', [MyNick, "Error reply "++FromRoom++" "++FromNick++" "], State),
 			%% we couldn't join the room
 			{ReplyCode, ErrorDescription} =
 			    case xml:get_subtag(El, "error") of
@@ -475,7 +544,7 @@ wait_for_cmd({route, From, _To, {xmlelement, "presence", Attrs, Els} = El}, Stat
 				    {'ERR_NOSUCHCHANNEL', "Unknown error"}
 			    end,
 			send_reply(ReplyCode, [Channel, ErrorDescription], State),
-					
+
 			NewJoiningDict = ?DICT:erase(FromRoom, State#state.joining),
 			State#state{joining = NewJoiningDict};
 		    _ ->
@@ -485,15 +554,80 @@ wait_for_cmd({route, From, _To, {xmlelement, "presence", Attrs, Els} = El}, Stat
 		end,
 	    {next_state, wait_for_cmd, NewState};
 	%% Presence in a channel we have already joined
-	{_, {ok, _}, ""} ->
+	% We have to build some new states here 
+	{_, {ok, ChannelData}, ""} ->
+	   BufferedNicks=ChannelData#channel.participants,
 	    %% Someone enters
-	    send_command(IRCSender, "JOIN", [Channel], State),
-	    {next_state, wait_for_cmd, State};
-	{_, {ok, _}, _} ->
-	    %% Someone leaves
+	    % make a NewBufferedNicks  
+            % do not send JOIN if this is me
+	    NewState=case FromNick of 
+		MyNick ->
+			State; 
+		_ -> 
+	    	      MyRole = case find_el("x", ?NS_MUC_USER, Els) of
+			  nothing ->
+			      "";
+			  XMucEl ->
+			      xml:get_path_s(XMucEl, [{elem, "item"}, {attr, "role"}])
+		      	end,
+			NewBufferedNicks=[{FromNick, MyRole}|BufferedNicks],
+			NewJoinedDict = ?DICT:update(FromRoom, 
+				fun(MyChannelData) ->
+					MyChannelData#channel{participants=NewBufferedNicks}
+				end,
+			State#state.joined),
+	    		send_command(IRCSender, "JOIN", [Channel], State),
+			State#state{joined=NewJoinedDict}
+		end,
+	    {next_state, wait_for_cmd, NewState};
+	{_, {ok, _}, "error"} ->
+	    % Some error occured this is maybe a nickname collision
+ 	    NewState=case FromNick of 
+		MyNick -> 
+	   		send_command(IRCSender, "PART", [Channel], State),
+			part_channels(Channel, State, "Nickname Collision");
+		_ -> State
+	    end,
+	    {next_state, wait_for_cmd, NewState};
+	{_, {ok, ChannelData}, "unavailable"} ->
+	   BufferedNicks=ChannelData#channel.participants,
+	    %% Someone leaves or we have a nick change 
+	    % NewRole enthält /presence/x/item@role but sometimes ""
+	   {NewNick, Status} = case find_el("x", ?NS_MUC_USER, Els) of
+		  nothing ->
+		      "";
+		  XMucEl ->
+		      {xml:get_path_s(XMucEl, [{elem, "item"}, {attr, "nick"}]),
+		      xml:get_path_s(XMucEl, [{elem, "status"}, {attr, "code"}])}
+	     	 end,
+	    NewState=case {NewNick, Status} of
+		{MyNick, "303"} -> % yes the nick was changed 
+			NewBufferedNicks=update_nick_in_list(FromNick, NewNick, BufferedNicks),
+			NewJoinedDict = ?DICT:update(FromRoom, 
+				fun(MyChannelData) ->
+					MyChannelData#channel{participants=NewBufferedNicks}
+				end,
+			State#state.joined),
+			State#state{joined = NewJoinedDict};
+		{_, _} ->
+			% something else happened   
+	   		send_command(IRCSender, "PART", [Channel], State),
+			State
+	   end,
+	   {next_state, wait_for_cmd, NewState};
+	{_, {ok, ChannelData}, _} ->
+	   BufferedNicks=ChannelData#channel.participants,
+	    %% in any other case Someone leaves, too 
+	  NewBufferedNicks=remove_nick_from_list(FromNick, BufferedNicks),
+	   NewJoinedDict = ?DICT:update(FromRoom, 
+		fun(MyChannelData) ->
+			MyChannelData#channel{participants=NewBufferedNicks}
+		end,
+	   State#state.joined),
 	    send_command(IRCSender, "PART", [Channel], State),
-	    {next_state, wait_for_cmd, State};
+	   {next_state, wait_for_cmd, State#state{joined = NewJoinedDict}};
 	_ ->
+	    %% to part channels with nickname collisions
 	    ?INFO_MSG("unexpected presence from ~s", [jlib:jid_to_string(From)]),
 	    {next_state, wait_for_cmd, State}
     end;
@@ -570,7 +704,7 @@ wait_for_cmd({route, From, _To, {xmlelement, "message", Attrs, Els} = El}, State
 	    %% XMPP and non-XMPP error messages...
 	    ErrorText =
 		error_to_string(xml:get_subtag(El, "error")),
-	    send_text_command("", "NOTICE", [State#state.nick, 
+	    send_text_command("", "NOTICE", [State#state.nick,
 					     "Message to "++ErrorFrom++" bounced: "++
 					     ErrorText], State),
 	    {next_state, wait_for_cmd, State};
@@ -603,15 +737,70 @@ wait_for_cmd(Event, State) ->
     ?INFO_MSG("unexpected event ~p", [Event]),
     {next_state, wait_for_cmd, State}.
 
+remove_nick_from_list(_, []) -> [];
+remove_nick_from_list(FromNick, BufferedNicks) -> remove_nick_from_list(FromNick, BufferedNicks, []).
+
+remove_nick_from_list(_, [], NewList) -> NewList;
+remove_nick_from_list(FromNick, [{Nick, Role}|BufferedNicks], NewList) ->
+	case Nick of
+		FromNick -> [NewList|BufferedNicks];
+		_ -> remove_nick_from_list(FromNick, BufferedNicks, [NewList|{Nick, Role}])
+	end.
+	
+update_nick_in_list(_, _, []) -> [];
+update_nick_in_list(OldNick, NewNick, BufferedNicks) -> update_nick_in_list(OldNick, NewNick, BufferedNicks, []).
+
+update_nick_in_list(_, _, [], NewList) -> NewList;
+update_nick_in_list(OldNick, NewNick, [{Nick, Role}|BufferedNicks], NewList) ->
+	case Nick of
+		OldNick ->
+			AllNicks=[NewList|BufferedNicks],
+			[{NewNick, Role}|AllNicks];
+		_ -> update_nick_in_list(OldNick, NewNick, BufferedNicks, [NewList|{Nick, Role}])
+	end.
+
+
+reply_names([], State) ->
+	State;
+reply_names([Channel|Channels], State) ->
+	case ?DICT:find(channel_to_jid(Channel, State), State#state.joined) of
+		{ok, ChannelData} -> reply_names(Channel, ChannelData, State) 
+	end,
+	reply_names(Channels, State). 
+
+reply_names(Channel, ChannelData, State) ->
+    	MyNick = State#state.nick,
+	send_reply('RPL_NAMREPLY',
+		   [MyNick, "=",
+		    Channel,
+		    lists:append(
+		      lists:map(
+			fun({Nick, Role}) ->
+				case Role of
+				    "moderator" ->
+					"@";
+				    "participant" ->
+					"+";
+				    _ ->
+					""
+				end ++ Nick ++ " "
+			end, ChannelData#channel.participants))],
+		   State),
+	send_reply('RPL_ENDOFNAMES',
+		   [Channel,
+		    "End of /NAMES list"],
+		   State).
+
+
 join_channels([], _, State) ->
     State;
 join_channels(Channels, [], State) ->
     join_channels(Channels, [none], State);
-join_channels([Channel | Channels], [Key | Keys], 
+join_channels([Channel | Channels], [Key | Keys],
 	      #state{nick = Nick} = State) ->
     Packet =
 	{xmlelement, "presence", [],
-	 [{xmlelement, "x", [{"xmlns", ?NS_MUC}], 
+	 [{xmlelement, "x", [{"xmlns", ?NS_MUC}],
 	   case Key of
 	       none ->
 		   [];
@@ -622,7 +811,7 @@ join_channels([Channel | Channels], [Key | Keys],
     To = channel_nick_to_jid(Nick, Channel, State),
     Room = jlib:jid_remove_resource(To),
     ejabberd_router:route(From, To, Packet),
-    NewState = State#state{joining = ?DICT:store(Room, [], State#state.joining)},
+    NewState = State#state{joining = ?DICT:store(Room, #channel{participants=[]}, State#state.joining)},
     join_channels(Channels, Keys, NewState).
 
 part_channels([], State, _Message) ->
@@ -644,7 +833,7 @@ part_channels([Channel | Channels], State, Message) ->
     part_channels(Channels, NewState, Message).
 
 parse_line(Line) ->
-    {Line1, LastParam} = 
+    {Line1, LastParam} =
 	case string:str(Line, " :") of
 	    0 ->
 		{Line, []};
@@ -698,7 +887,7 @@ send_command(Sender, Command, Params, State, AlwaysQuote) ->
 	     end,
     ParamString = make_param_string(Params, AlwaysQuote),
     send_line(Prefix ++ " " ++ Command ++ ParamString, State).
-    
+
 send_reply(Reply, Params, State) ->
     Number = case Reply of
 		 'ERR_UNKNOWNCOMMAND' ->
@@ -717,6 +906,12 @@ send_reply(Reply, Params, State) ->
 		     "502";
 		 'RPL_UMODEIS' ->
 		     "221";
+		 'RPL_LISTSTART' ->
+		     "321";
+		 'RPL_LIST' ->
+		     "322";
+		 'RPL_LISTEND' ->
+		     "323";
 		 'RPL_CHANNELMODEIS' ->
 		     "324";
 		 'RPL_NAMREPLY' ->
@@ -769,6 +964,8 @@ find_el(Name, NS, [{xmlelement, N, Attrs, _} = El|Els]) ->
 find_el(_, _, []) ->
     nothing.
 
+%as the name says this delivers the jid of a channel name. 
+% to #foo it returns foo@example.net
 channel_to_jid([$#|Channel], State) ->
     channel_to_jid(Channel, State);
 channel_to_jid(Channel, #state{muc_host = MucHost,
@@ -778,6 +975,8 @@ channel_to_jid(Channel, #state{muc_host = MucHost,
 	_ -> jlib:make_jid(Channel, MucHost, "")
     end.
 
+%this delivers the jid of a channel name including the Nickname as resource 
+% to #foo and nick bar it returns foo@example.net/bar
 channel_nick_to_jid(Nick, [$#|Channel], State) ->
     channel_nick_to_jid(Nick, Channel, State);
 channel_nick_to_jid(Nick, Channel, #state{muc_host = MucHost,
@@ -803,8 +1002,8 @@ make_irc_sender(Nick, #jid{luser = Room} = RoomJID,
 make_irc_sender(#jid{lresource = Nick} = JID, State) ->
     make_irc_sender(Nick, JID, State).
 
-user_jid(#state{nick = Nick, host = Host}) ->
-    jlib:make_jid(Nick, Host, "irc").
+user_jid(#state{jidnick = JidNick, host = Host}) ->
+    jlib:make_jid(JidNick, Host, "irc").
 
 filter_cdata(Msg) ->
     [{xmlcdata, filter_message(Msg)}].
@@ -839,7 +1038,7 @@ parse_error({xmlelement, "error", _ErrorAttrs, ErrorEls} = ErrorEl) ->
 	    _ ->
 		"unknown error"
 	end,
-    ErrorText = 
+    ErrorText =
 	case ErrorTextEl of
 	    {xmlelement, _, _, _} ->
 		xml:get_tag_cdata(ErrorTextEl);
@@ -847,7 +1046,7 @@ parse_error({xmlelement, "error", _ErrorAttrs, ErrorEls} = ErrorEl) ->
 		nothing
     end,
     {ErrorName, ErrorText}.
-    
+
 error_to_string({xmlelement, "error", _ErrorAttrs, _ErrorEls} = ErrorEl) ->
     case parse_error(ErrorEl) of
 	{ErrorName, ErrorText} when is_list(ErrorText) ->

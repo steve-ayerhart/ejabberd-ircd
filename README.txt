@@ -1,15 +1,15 @@
 
 	ircd  -  IRC-to-XMPP interface
 
-	Author: 
+	Author:
 	  Magnus Henoch
 	  xmpp:legoscia@jabber.cd.chalmers.se,
-	  mailto:henoch@dtek.chalmers.se
+	  mailto:magnus.henoch@gmail.com
 	Homepage:
 	  http://www.dtek.chalmers.se/~henoch/text/ejabberd-ircd.html
 	Requirements:
-	  ejabberd 2.0.x
-	
+	  ejabberd 2.0.5 or higher 
+
 
 	DESCRIPTION
 	===========
@@ -27,7 +27,6 @@ and a command to list channels.
 Note that this module changes ejabberd_sup.erl, which may collide with
 other extensions.  Merging the changes by hand should not be
 difficult.
-
 
 	CONFIGURATION
 	=============
