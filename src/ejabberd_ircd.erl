@@ -203,6 +203,7 @@ wait_for_login({line, #line{command = "WEBIRC", params = [Password, _, _, _]}}, 
     		send_reply('ERR_NOTONCHANNEL', ["You're not on that channel"], State),
 		{stop, normal, State}
     end;
+
 wait_for_login({line, #line{command = "PASS", params = [Pass | _]}}, State) ->
     {next_state, wait_for_login, State#state{pass = Pass}};
 
