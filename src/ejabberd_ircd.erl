@@ -11,7 +11,7 @@
 
 %% gen_fsm callbacks
 -export([init/1,
-	 wait_for_nick/2,
+	 wait_for_login/2,
 	 wait_for_cmd/2,
 	 handle_event/3,
 	 handle_sync_event/4,
@@ -38,6 +38,7 @@
 		pass = "",
 		nick = none,
 		user = none,
+		realname = none,
 		%% joining is a mapping from room JIDs to nicknames
 		%% received but not yet forwarded
 		joining = ?DICT:new(),
@@ -121,7 +122,7 @@ init([{SockMod, Socket}, Opts]) ->
 		    ChannelMappings),
     inet:setopts(Socket, [list, {packet, line}, {active, true}]),
     %%_ReceiverPid = start_ircd_receiver(Socket, SockMod),
-    {ok, wait_for_nick, #state{socket    = Socket,
+    {ok, wait_for_login, #state{socket    = Socket,
 			       sockmod   = SockMod,
 			       access    = Access,
 			       encoding  = Encoding,
@@ -155,7 +156,7 @@ handle_event(_Event, StateName, StateData) ->
 code_change(_OldVsn, StateName, StateData, _Extra) ->
     {ok, StateName, StateData}.
 terminate(_Reason, _StateName, #state{socket = Socket, sockmod = SockMod,
-				      sid = SID, host = Host, nick = Nick,
+				      sid = SID, nick = Nick,
 				      joined = JoinedDict} = State) ->
     ?INFO_MSG("closing IRC connection for ~p", [Nick]),
     case SID of
@@ -168,48 +169,56 @@ terminate(_Reason, _StateName, #state{socket = Socket, sockmod = SockMod,
 	    ?DICT:map(fun(ChannelJID, _ChannelData) ->
 			      ejabberd_router:route(FromJID, ChannelJID, Packet)
 		      end, JoinedDict),
-	    ejabberd_sm:close_session_unset_presence(SID, Nick, Host, "irc", "Logged out")
+	    ejabberd_sm:close_session_unset_presence(SID, FromJID#jid.user,
+						     FromJID#jid.server, FromJID#jid.resource,
+						     "Logged out")
     end,
     gen_tcp = SockMod,
     ok = gen_tcp:close(Socket),
     ok.
 
 
-wait_for_nick({line, #line{command = "PASS", params = Params}}, State) ->
-    ?DEBUG("in wait_for_nick", []),
-    Pass = hd(Params),
-    ?DEBUG("got password", []),
-    {next_state, wait_for_nick, State#state{pass = Pass}};
-wait_for_nick({line, #line{command = "NICK", params = Params}}, State) ->
-    ?DEBUG("in wait_for_nick", []),
-    Nick = hd(Params),
-    Pass = State#state.pass,
-    Server = State#state.host,
+wait_for_login({line, #line{command = "PASS", params = [Pass | _]}}, State) ->
+    {next_state, wait_for_login, State#state{pass = Pass}};
 
-    JID = jlib:make_jid(Nick, Server, "irc"),
+wait_for_login({line, #line{command = "NICK", params = [Nick | _]}}, State) ->
+    wait_for_login(info_available, State#state{nick = Nick});
+
+wait_for_login({line, #line{command = "USER", params = [User, _Host, _Server, Realname]}}, State) ->
+    wait_for_login(info_available, State#state{user = User,
+					       realname = Realname});
+wait_for_login(info_available, #state{host = Server,
+				      nick = Nick,
+				      pass = Pass,
+				      user = User,
+				      realname = Realname} = State)
+  when Nick =/= none andalso
+       User =/= none andalso
+       Realname =/= none ->
+    JID = user_jid(State),
     case JID of
 	error ->
 	    ?DEBUG("invalid nick '~p'", [Nick]),
 	    send_reply('ERR_ERRONEUSNICKNAME', [Nick, "Erroneous nickname"], State),
-	    {next_state, wait_for_nick, State};
+	    {next_state, wait_for_login, State};
 	_ ->
 	    case acl:match_rule(Server, State#state.access, JID) of
 		deny ->
 		    ?DEBUG("access denied for '~p'", [Nick]),
 		    send_reply('ERR_NICKCOLLISION', [Nick, "Nickname collision"], State),
-		    {next_state, wait_for_nick, State};
+		    {next_state, wait_for_login, State};
 		allow ->
 		    case ejabberd_auth:check_password(Nick, Server, Pass) of
 			false ->
 			    ?DEBUG("auth failed for '~p'", [Nick]),
 			    send_reply('ERR_NICKCOLLISION', [Nick, "Authentication failed"], State),
-			    {next_state, wait_for_nick, State};
+			    {next_state, wait_for_login, State};
 			true ->
 			    ?DEBUG("good nickname '~p'", [Nick]),
 			    SID = {now(), self()},
 			    Info = [{ip, peerip(gen_tcp, State#state.socket)}, {conn, irc}],
 			    ejabberd_sm:open_session(
-			      SID, Nick, Server, "irc", Info),
+			      SID, JID#jid.user, JID#jid.server, JID#jid.resource, Info),
 			    send_text_command("", "001", [Nick, "IRC interface of ejabberd server "++Server], State),
 			    send_reply('RPL_MOTDSTART', [Nick, "- "++Server++" Message of the day - "], State),
 			    send_reply('RPL_MOTD', [Nick, "- This is the IRC interface of the ejabberd server "++Server++"."], State),
@@ -222,10 +231,14 @@ wait_for_nick({line, #line{command = "NICK", params = Params}}, State) ->
 		    end
 	    end
     end;
-wait_for_nick(Event, State) ->
-    ?DEBUG("in wait_for_nick", []),
+wait_for_login(info_available, State) ->
+    %% Ignore if either NICK or USER is pending
+    {next_state, wait_for_login, State};
+
+wait_for_login(Event, State) ->
+    ?DEBUG("in wait_for_login", []),
     ?INFO_MSG("unexpected event ~p", [Event]),
-    {next_state, wait_for_nick, State}.
+    {next_state, wait_for_login, State}.
 
 peerip(SockMod, Socket) ->
     IP = case SockMod of
@@ -823,8 +836,8 @@ make_irc_sender(Nick, #jid{luser = Room} = RoomJID,
 make_irc_sender(#jid{lresource = Nick} = JID, State) ->
     make_irc_sender(Nick, JID, State).
 
-user_jid(#state{nick = Nick, host = Host}) ->
-    jlib:make_jid(Nick, Host, "irc").
+user_jid(#state{user = User, host = Host, realname = Realname}) ->
+    jlib:make_jid(User, Host, Realname).
 
 filter_cdata(Msg) ->
     [{xmlcdata, filter_message(Msg)}].
