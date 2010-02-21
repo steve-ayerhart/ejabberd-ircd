@@ -376,6 +376,21 @@ wait_for_cmd({line, #line{command = "MODE", params = [ModeOf | Params]}}, State)
     end,
     {next_state, wait_for_cmd, State};
 
+wait_for_cmd({line, #line{command = "NICK", params = [NewNick | _]}}, State) ->
+    Joined =
+	?DICT:size(State#state.joining) == 0 andalso
+	?DICT:size(State#state.joined) == 0,
+    if
+	Joined ->
+	    OldNick = State#state.nick,
+	    OldMe = OldNick ++ "!" ++ OldNick ++ "@" ++ State#state.host,
+	    NewState = State#state{nick = NewNick},
+	    send_text_command(OldMe, "NICK", [NewNick], NewState),
+	    {next_state, wait_for_cmd, NewState};
+	true ->
+	    send_reply('ERR_NICKCOLLISION', [NewNick, "Cannot change nickname while in channel"], State),
+	    {next_state, wait_for_cmd, State}
+    end;
 wait_for_cmd({line, #line{command = "QUIT"}}, State) ->
     %% quit message is ignored for now
     {stop, normal, State};
