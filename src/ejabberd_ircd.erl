@@ -905,6 +905,10 @@ send_reply(Reply, Params, State) ->
 		     "501";
 		 'ERR_USERSDONTMATCH' ->
 		     "502";
+		 'ERR_NOSUCHCHANNEL' ->
+		     "403";
+		 'ERR_INVITEONLYCHAN' ->
+		     "473";
 		 'RPL_UMODEIS' ->
 		     "221";
 		 'RPL_LISTSTART' ->
