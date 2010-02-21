@@ -227,8 +227,9 @@ wait_for_nick({line, #line{command = "NICK", params = Params}}, State) ->
 			true ->
 			    ?DEBUG("good nickname '~p'", [Nick]),
 			    SID = {now(), self()},
+			    Info = [{ip, peerip(gen_tcp, State#state.socket)}, {conn, irc}],
 			    ejabberd_sm:open_session(
-			      SID, Nick, Server, "irc", peerip(gen_tcp, State#state.socket)),
+			      SID, Nick, Server, "irc", Info),
 			    send_text_command("", "001", [Nick, "IRC interface of ejabberd server "++Server], State),
 			    send_reply('RPL_MOTDSTART', [Nick, "- "++Server++" Message of the day - "], State),
 			    send_reply('RPL_MOTD', [Nick, "- This is the IRC interface of the ejabberd server "++Server++"."], State),
