@@ -526,6 +526,43 @@ wait_for_cmd({line, #line{command = "NICK", params = [NewNick | _]}}, State) ->
 	    {next_state, wait_for_cmd, State}
     end;
 
+wait_for_cmd({line, #line{command = "LIST"}}, #state{nick = Nick} = State) ->
+    Id = randoms:get_string(),
+    ejabberd_router:route(user_jid(State), jlib:make_jid("", State#state.muc_host, ""),
+			  {xmlelement, "iq", [{"type", "get"},
+					      {"id", Id}],
+			   [{xmlelement, "query",
+			     [{"xmlns", ?NS_DISCO_ITEMS}], []}
+			   ]}),
+    F = fun(Reply, State2) ->
+		Type = xml:get_tag_attr_s("type", Reply),
+		Xmlns = xml:get_path_s(Reply, [{elem, "query"}, {attr, "xmlns"}]),
+		case {Type, Xmlns} of
+		    {"result", ?NS_DISCO_ITEMS} ->
+			{xmlelement, _, _, Items} = xml:get_subtag(Reply, "query"),
+			send_reply('RPL_LISTSTART', [Nick, "N Title"], State2),
+			lists:foreach(fun({xmlelement, "item", _, _} = El) ->
+					      case {xml:get_tag_attr("jid", El),
+						    xml:get_tag_attr("name", El)} of
+						  {{value, JID}, false} ->
+						      Channel = jid_to_channel(jlib:string_to_jid(JID), State2),
+						      send_reply('RPL_LIST', [Nick, Channel, "0", ""], State2);
+						  {{value, JID}, {value, Name}} ->
+						      Channel = jid_to_channel(jlib:string_to_jid(JID), State2),
+						      %% TODO: iconv(Name)
+						      send_reply('RPL_LIST', [Nick, Channel, "0", Name], State2);
+						  _ -> ok
+					      end
+				      end, Items),
+			send_reply('RPL_LISTEND', [Nick, "End of discovery result"], State2);
+		    _ ->
+			send_reply('ERR_NOSUCHSERVER', ["Invalid response"], State2)
+		end,
+		{next_state, wait_for_cmd, State2}
+	end,
+    NewState = State#state{outgoing_requests = ?DICT:append(Id, F, State#state.outgoing_requests)},
+    {next_state, wait_for_cmd, NewState};
+
 wait_for_cmd({line, #line{command = "QUIT"}}, State) ->
     %% quit message is ignored for now
     {stop, normal, State};
@@ -1040,7 +1077,13 @@ send_reply(Reply, Params, State) ->
 		 'RPL_MOTDSTART' ->
 		     "375";
 		 'RPL_ENDOFMOTD' ->
-		     "376"
+		     "376";
+		 'RPL_LISTSTART' ->
+		     "321";
+		 'RPL_LIST' ->
+		     "322";
+		 'RPL_LISTEND' ->
+		     "323"
 	     end,
     send_text_command("", Number, Params, State).
 
