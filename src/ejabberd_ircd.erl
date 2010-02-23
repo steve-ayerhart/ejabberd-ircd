@@ -170,7 +170,7 @@ code_change(_OldVsn, StateName, StateData, _Extra) ->
 terminate(_Reason, _StateName, #state{socket = Socket, sockmod = SockMod,
 				      sid = SID, nick = Nick,
 				      joined = JoinedDict} = State) ->
-    ?INFO_MSG("closing IRC connection for ~p", [JidNick]),
+    ?INFO_MSG("closing IRC connection for ~p", [Nick]),
     case SID of
 	none ->
 	    ok;
