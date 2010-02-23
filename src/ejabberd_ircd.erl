@@ -11,7 +11,7 @@
 
 %% gen_fsm callbacks
 -export([init/1,
-	 wait_for_nick/2,
+	 wait_for_login/2,
 	 wait_for_cmd/2,
 	 handle_event/3,
 	 handle_sync_event/4,
@@ -43,13 +43,16 @@
 		% this is initially the same as the Nickname seen in the channels
 		jidnick = none,
 		user = none,
+		realname = none,
 		%% joining is a mapping from room JIDs to nicknames
 		%% received but not yet forwarded
 		joining = ?DICT:new(),
 		joined = ?DICT:new(),
 		%% mapping certain channels to certain rooms
 		channels_to_jids = ?DICT:new(),
-		jids_to_channels = ?DICT:new()
+		jids_to_channels = ?DICT:new(),
+		%% maps /iq/@id to {ReplyFun/1, expire timestamp
+		outgoing_requests = ?DICT:new()
 	       }).
 -record(channel, {participants = [],
 		  topic = ""}).
@@ -130,7 +133,7 @@ init([{SockMod, Socket}, Opts]) ->
 		    ChannelMappings),
     inet:setopts(Socket, [list, {packet, line}, {active, true}]),
     %%_ReceiverPid = start_ircd_receiver(Socket, SockMod),
-    {ok, wait_for_nick, #state{socket    = Socket,
+    {ok, wait_for_login, #state{socket    = Socket,
 			       sockmod   = SockMod,
 			       access    = Access,
 			       encoding  = Encoding,
@@ -165,9 +168,9 @@ handle_event(_Event, StateName, StateData) ->
 code_change(_OldVsn, StateName, StateData, _Extra) ->
     {ok, StateName, StateData}.
 terminate(_Reason, _StateName, #state{socket = Socket, sockmod = SockMod,
-				      sid = SID, host = Host, jidnick = JidNick,
+				      sid = SID, nick = Nick,
 				      joined = JoinedDict} = State) ->
-    ?INFO_MSG("closing IRC connection for ~p", [JidNick]),
+    ?INFO_MSG("closing IRC connection for ~p", [Nick]),
     case SID of
 	none ->
 	    ok;
@@ -178,57 +181,66 @@ terminate(_Reason, _StateName, #state{socket = Socket, sockmod = SockMod,
 	    ?DICT:map(fun(ChannelJID, _ChannelData) ->
 			      ejabberd_router:route(FromJID, ChannelJID, Packet)
 		      end, JoinedDict),
-	    ejabberd_sm:close_session_unset_presence(SID, JidNick, Host, "irc", "Logged out")
+	    ejabberd_sm:close_session_unset_presence(SID, FromJID#jid.user,
+						     FromJID#jid.server, FromJID#jid.resource,
+						     "Logged out")
     end,
     gen_tcp = SockMod,
     ok = gen_tcp:close(Socket),
     ok.
 
 
-wait_for_nick({line, #line{command = "WEBIRC", params = [Password, _, _, _]}}, State) ->
-    ?DEBUG("in wait_for_nick", []),
+wait_for_login({line, #line{command = "WEBIRC", params = [Password, _, _, _]}}, State) ->
+    ?DEBUG("in wait_for_login", []),
     ?DEBUG("got webirc pass ~p", [Password]),
     if
 	Password==State#state.webirc -> 
-		{next_state, wait_for_nick, State};
+		{next_state, wait_for_login, State};
 	true -> 
     		send_reply('ERR_NOTONCHANNEL', ["You're not on that channel"], State),
 		{stop, normal, State}
     end;
-wait_for_nick({line, #line{command = "PASS", params = Params}}, State) ->
-    ?DEBUG("in wait_for_nick", []),
-    Pass = hd(Params),
-    ?DEBUG("got password", []),
-    {next_state, wait_for_nick, State#state{pass = Pass}};
-wait_for_nick({line, #line{command = "NICK", params = Params}}, State) ->
-    ?DEBUG("in wait_for_nick", []),
-    Nick = hd(Params),
-    Pass = State#state.pass,
-    Server = State#state.host,
+wait_for_login({line, #line{command = "PASS", params = [Pass | _]}}, State) ->
+    {next_state, wait_for_login, State#state{pass = Pass}};
 
-    JID = jlib:make_jid(Nick, Server, "irc"),
+wait_for_login({line, #line{command = "NICK", params = [Nick | _]}}, State) ->
+    wait_for_login(info_available, State#state{nick = Nick});
+
+wait_for_login({line, #line{command = "USER", params = [User, _Host, _Server, Realname]}}, State) ->
+    wait_for_login(info_available, State#state{user = User,
+					       realname = Realname});
+wait_for_login(info_available, #state{host = Server,
+				      nick = Nick,
+				      pass = Pass,
+				      user = User,
+				      realname = Realname} = State)
+  when Nick =/= none andalso
+       User =/= none andalso
+       Realname =/= none ->
+    JID = user_jid(State),
     case JID of
 	error ->
 	    ?DEBUG("invalid nick '~p'", [Nick]),
 	    send_reply('ERR_ERRONEUSNICKNAME', [Nick, "Erroneous nickname"], State),
-	    {next_state, wait_for_nick, State};
+	    {next_state, wait_for_login, State};
 	_ ->
 	    case acl:match_rule(Server, State#state.access, JID) of
 		deny ->
 		    ?DEBUG("access denied for '~p'", [Nick]),
 		    send_reply('ERR_NICKCOLLISION', [Nick, "Nickname collision"], State),
-		    {next_state, wait_for_nick, State};
+		    {next_state, wait_for_login, State};
 		allow ->
 		    case ejabberd_auth:check_password(Nick, Server, Pass) of
 			false ->
 			    ?DEBUG("auth failed for '~p'", [Nick]),
 			    send_reply('ERR_NICKCOLLISION', [Nick, "Authentication failed"], State),
-			    {next_state, wait_for_nick, State};
+			    {next_state, wait_for_login, State};
 			true ->
 			    ?DEBUG("good nickname '~p'", [Nick]),
 			    SID = {now(), self()},
+			    Info = [{ip, peerip(gen_tcp, State#state.socket)}, {conn, irc}],
 			    ejabberd_sm:open_session(
-			      SID, Nick, Server, "irc", peerip(gen_tcp, State#state.socket)),
+			      SID, JID#jid.user, JID#jid.server, JID#jid.resource, Info),
 			    send_text_command("", "001", [Nick, "IRC interface of ejabberd server "++Server], State),
 			    send_reply('RPL_MOTDSTART', [Nick, "- "++Server++" Message of the day - "], State),
 			    send_reply('RPL_MOTD', [Nick, "- This is the IRC interface of the ejabberd server "++Server++"."], State),
@@ -241,10 +253,14 @@ wait_for_nick({line, #line{command = "NICK", params = Params}}, State) ->
 		    end
 	    end
     end;
-wait_for_nick(Event, State) ->
-    ?DEBUG("in wait_for_nick", []),
+wait_for_login(info_available, State) ->
+    %% Ignore if either NICK or USER is pending
+    {next_state, wait_for_login, State};
+
+wait_for_login(Event, State) ->
+    ?DEBUG("in wait_for_login", []),
     ?INFO_MSG("unexpected event ~p", [Event]),
-    {next_state, wait_for_nick, State}.
+    {next_state, wait_for_login, State}.
 
 peerip(SockMod, Socket) ->
     IP = case SockMod of
@@ -275,16 +291,6 @@ wait_for_cmd({line, #line{command = "JOIN", params = Params}}, State) ->
 wait_for_cmd({line, #line{command = "NAMES", params = [ChannelsString]}}, State) ->
     ?DEBUG("in wait_for_cmd NAMES ~p", [ChannelsString]),
     reply_names(string:tokens(ChannelsString, ","), State),
-    {next_state, wait_for_cmd, State};
-
-wait_for_cmd({line, #line{command = "LIST", params = _}}, State) ->
-    ?DEBUG("in wait_for_cmd LIST", []),
-    send_reply('RPL_LISTSTART', [State#state.nick, "Start of Channels list"], State),
-    lists:foreach(
-    fun(Channel) ->
-    	send_reply('RPL_LIST', [State#state.nick, "#"++Channel], State)
-    end, ?DICT:fetch_keys(State#state.channels_to_jids)),
-    send_reply('RPL_LISTEND', [State#state.nick, "End of Channels list"], State),
     {next_state, wait_for_cmd, State};
 
 wait_for_cmd({line, #line{command = "NICK", params = [NewNick]}}, State) ->
@@ -436,6 +442,47 @@ wait_for_cmd({line, #line{command = "MODE", params = [ModeOf | Params]}}, State)
 	    end
     end,
     {next_state, wait_for_cmd, State};
+
+wait_for_cmd({line, #line{command = "LIST"}}, #state{nick = Nick} = State) ->
+    Id = randoms:get_string(),
+    ejabberd_router:route(user_jid(State), jlib:make_jid("", State#state.muc_host, ""),
+			  {xmlelement, "iq", [{"type", "get"},
+					      {"id", Id}],
+			   [{xmlelement, "query",
+			     [{"xmlns", ?NS_DISCO_ITEMS}], []}
+			   ]}),
+    F = fun(Reply, State2) ->
+		Type = xml:get_tag_attr_s("type", Reply),
+		Xmlns = xml:get_path_s(Reply, [{elem, "query"}, {attr, "xmlns"}]),
+		case {Type, Xmlns} of
+		    {"result", ?NS_DISCO_ITEMS} ->
+			{xmlelement, _, _, Items} = xml:get_subtag(Reply, "query"),
+			send_reply('RPL_LISTSTART', [Nick, "N Title"], State2),
+			lists:foreach(fun({xmlelement, "item", _, _} = El) ->
+					      case {xml:get_tag_attr("jid", El),
+						    xml:get_tag_attr("name", El)} of
+						  {{value, JID}, false} ->
+						      Channel = jid_to_channel(jlib:string_to_jid(JID), State2),
+						      send_reply('RPL_LIST', [Nick, Channel, "0", ""], State2);
+						  {{value, JID}, {value, Name}} ->
+						      Channel = jid_to_channel(jlib:string_to_jid(JID), State2),
+						      %% TODO: iconv(Name)
+						      send_reply('RPL_LIST', [Nick, Channel, "0", Name], State2);
+						  _ -> ok
+					      end
+				      end, Items),
+    			lists:foreach(
+    				fun(Channel) ->
+    					send_reply('RPL_LIST', [State#state.nick, "#"++Channel], State)
+    				end, ?DICT:fetch_keys(State#state.channels_to_jids)),
+			send_reply('RPL_LISTEND', [Nick, "End of discovery result"], State2);
+		    _ ->
+			send_reply('ERR_NOSUCHSERVER', ["Invalid response"], State2)
+		end,
+		{next_state, wait_for_cmd, State2}
+	end,
+    NewState = State#state{outgoing_requests = ?DICT:append(Id, F, State#state.outgoing_requests)},
+    {next_state, wait_for_cmd, NewState};
 
 wait_for_cmd({line, #line{command = "QUIT"}}, State) ->
     %% quit message is ignored for now
@@ -733,6 +780,20 @@ wait_for_cmd({route, From, _To, {xmlelement, "message", Attrs, Els} = El}, State
 	    end
     end;
 
+wait_for_cmd({route, From, To, {xmlelement, "iq", Attrs, _} = El},
+	     #state{outgoing_requests = OutgoingRequests} = State) ->
+    Type = xml:get_attr_s("type", Attrs),
+    Id = xml:get_attr_s("id", Attrs),
+    case ?DICT:find(Id, OutgoingRequests) of
+	{ok, [F]} when Type == "result"; Type == "error" ->
+	    NewState = State#state{outgoing_requests = ?DICT:erase(Id, OutgoingRequests)},
+	    F(El, NewState);
+	_ when Type == "get"; Type == "set" ->
+	    ejabberd_router:route(To, From,
+				  jlib:make_error_reply(El, ?ERR_FEATURE_NOT_IMPLEMENTED)),
+	    {next_state, wait_for_cmd, State}
+    end;
+
 wait_for_cmd(Event, State) ->
     ?INFO_MSG("unexpected event ~p", [Event]),
     {next_state, wait_for_cmd, State}.
@@ -904,6 +965,12 @@ send_reply(Reply, Params, State) ->
 		     "501";
 		 'ERR_USERSDONTMATCH' ->
 		     "502";
+		 'ERR_NOSUCHCHANNEL' ->
+		     "403";
+		 'ERR_INVITEONLYCHAN' ->
+		     "473";
+		 'ERR_NOSUCHSERVER' ->
+		     "402";
 		 'RPL_UMODEIS' ->
 		     "221";
 		 'RPL_LISTSTART' ->
@@ -1002,8 +1069,8 @@ make_irc_sender(Nick, #jid{luser = Room} = RoomJID,
 make_irc_sender(#jid{lresource = Nick} = JID, State) ->
     make_irc_sender(Nick, JID, State).
 
-user_jid(#state{jidnick = JidNick, host = Host}) ->
-    jlib:make_jid(JidNick, Host, "irc").
+user_jid(#state{user = User, host = Host, realname = Realname}) ->
+    jlib:make_jid(User, Host, Realname).
 
 filter_cdata(Msg) ->
     [{xmlcdata, filter_message(Msg)}].
