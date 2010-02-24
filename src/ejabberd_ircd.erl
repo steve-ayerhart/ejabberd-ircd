@@ -408,6 +408,28 @@ wait_for_cmd({line, #line{command = "TOPIC", params = Params}}, State) ->
     end,
     {next_state, wait_for_cmd, State};
 
+%% USERHOST command
+wait_for_cmd({line, #line{command = "USERHOST", params = Params}}, State) ->
+	case Params of
+	[] ->
+		send_reply('ERR_NEEDMOREPARAMS', ["USERHOST", "Not enough parameters"], State);
+	UserParams ->
+		Users = lists:sublist(string:tokens(UserParams, " "), 5), %% RFC 1459 specifies 5 items max
+		lists:foreach(
+			fun(UserSubList) ->
+				User = lists:last(UserSubList),
+				case ejabberd_sm:get_user_info(User, State#state.host, "irc") of
+				offline -> 
+					send_reply('RPL_USERHOST',[State#state.nick, User++" offline"], State);
+				[_Node, _Conn, Ip] -> 
+					{_,{{IP1,IP2,IP3,IP4}, _}} = Ip,
+					send_reply('RPL_USERHOST',[State#state.nick, User ++ "=+" ++ integer_to_list(IP1) ++ "." ++ 
+					integer_to_list(IP2) ++ "." ++ integer_to_list(IP3) ++ "." ++ integer_to_list(IP4)], State)
+				end
+			end, Users)
+	end,
+	{next_state, wait_for_cmd, State};
+
 wait_for_cmd({line, #line{command = "MODE", params = [ModeOf | Params]}}, State) ->
     case ModeOf of
 	[$# | Channel] ->
