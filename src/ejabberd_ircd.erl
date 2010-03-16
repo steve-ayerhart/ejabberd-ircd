@@ -450,7 +450,8 @@ wait_for_cmd({line, #line{command = "LIST"}}, #state{nick = Nick} = State) ->
     NewState = State#state{outgoing_requests = ?DICT:append(Id, F, State#state.outgoing_requests)},
     {next_state, wait_for_cmd, NewState};
 
-wait_for_cmd({line, #line{command = "WHO", params = [Channel]}}, #state{nick = MyNick} = State) ->
+wait_for_cmd({line, #line{command = "WHO", params = [[$# | Channel1] = Channel]}},
+	     #state{nick = MyNick} = State) ->
     case ?DICT:find(Channel, State#state.seen) of
 	{ok, ChannelSeen} ->
 	    ?DICT:fold(fun(Nick, #seen{show = Show, role = Role}, _) ->
@@ -474,7 +475,7 @@ wait_for_cmd({line, #line{command = "WHO", params = [Channel]}}, #state{nick = M
 			       send_reply('RPL_WHOREPLY', [MyNick,
 							   Channel,
 							   JID#jid.resource,
-							   JID#jid.server,
+							   Channel1,
 							   JID#jid.server,
 							   Nick,
 							   Flags,
@@ -964,7 +965,7 @@ update_seen(Channel, F, Seen) ->
 get_seen(Channel, Nick, Seen) ->
     case ?DICT:find(Channel, Seen) of
 	{ok, ChannelSeen} ->
-	    ?DICT:find(ChannelSeen, Nick);
+	    ?DICT:find(Nick, ChannelSeen);
 	error ->
 	    error
     end.
