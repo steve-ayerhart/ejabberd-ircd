@@ -487,6 +487,32 @@ wait_for_cmd({line, #line{command = "WHO", params = [[$# | Channel1] = Channel]}
     end,
     {next_state, wait_for_cmd, State};
 
+wait_for_cmd({line, #line{command = "AWAY", params = []}}, #state{nick = Nick} = State) ->
+    Packet =
+	{xmlelement, "presence", [], []},
+    From = user_jid(State),
+    foreach_channel(fun(Room, _) ->
+			    ejabberd_router:route(From, Room, Packet)
+		    end, State),
+    send_reply('RPL_UNAWAY', [Nick, "Presence sent"], State),
+    {next_state, wait_for_cmd, State};
+
+wait_for_cmd({line, #line{command = "AWAY", params = [AwayMsg]}}, #state{nick = Nick} = State) ->
+    Packet =
+	{xmlelement, "presence", [],
+	 [
+	  {xmlelement, "show", [],
+	   [{xmlcdata, "away"}]},
+	  {xmlelement, "status", [],
+	   [{xmlcdata, AwayMsg}]}
+	 ]},
+    From = user_jid(State),
+    foreach_channel(fun(Room, _) ->
+			    ejabberd_router:route(From, Room, Packet)
+		    end, State),
+    send_reply('RPL_NOWAWAY', [Nick, "Presence sent: " ++ AwayMsg], State),
+    {next_state, wait_for_cmd, State};
+
 wait_for_cmd({line, #line{command = "QUIT"}}, State) ->
     %% quit message is ignored for now
     {stop, normal, State};
@@ -915,7 +941,11 @@ send_reply(Reply, Params, State) ->
 		 'RPL_WHOREPLY' ->
 		     "352";
 		 'RPL_ENDOFWHO' ->
-		     "315"
+		     "315";
+		 'RPL_NOWAWAY' ->
+		     "306";
+		 'RPL_UNAWAY' ->
+		     "305"
 	     end,
     send_text_command("", Number, Params, State).
 
@@ -969,6 +999,10 @@ get_seen(Channel, Nick, Seen) ->
 	error ->
 	    error
     end.
+
+foreach_channel(F, #state{joined = Joined, joining = Joining}) ->
+    ?DICT:map(F, Joined),
+    ?DICT:map(F, Joining).
 
 channel_to_jid([$#|Channel], State) ->
     channel_to_jid(Channel, State);
