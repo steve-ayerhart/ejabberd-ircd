@@ -47,10 +47,14 @@
 		channels_to_jids = ?DICT:new(),
 		jids_to_channels = ?DICT:new(),
 		%% maps /iq/@id to {ReplyFun/1, expire timestamp
-		outgoing_requests = ?DICT:new()
+		outgoing_requests = ?DICT:new(),
+		%% maps to #seen per channel
+		seen = ?DICT:new()
 	       }).
 -record(channel, {participants = [],
 		  topic = ""}).
+
+-record(seen, {status, show}).
 
 -record(line, {prefix, command, params}).
 
@@ -462,6 +466,9 @@ wait_for_cmd({route, From, _To, {xmlelement, "presence", Attrs, Els} = El}, Stat
     FromRoom = jlib:jid_remove_resource(From),
     FromNick = From#jid.resource,
 
+    Status = xml:get_path_s(El, [{elem, "status"}, cdata]),
+    Show = xml:get_path_s(El, [{elem, "show"}, cdata]),
+
     Channel = jid_to_channel(From, State),
     MyNick = State#state.nick,
     IRCSender = make_irc_sender(FromNick, FromRoom, State),
@@ -522,7 +529,13 @@ wait_for_cmd({route, From, _To, {xmlelement, "presence", Attrs, Els} = El}, Stat
 				    joined = NewJoinedDict};
 		    _ ->
 			NewJoining = ?DICT:store(FromRoom, NewBufferedNicks, State#state.joining),
-			State#state{joining = NewJoining}
+			NewSeen = update_seen(Channel,
+					      fun(D) ->
+						      ?DICT:store(FromNick,
+								  #seen{status = Status, show = Show},
+								  D)
+					      end, State#state.seen),
+			State#state{joining = NewJoining, seen = NewSeen}
 		end,
 	    {next_state, wait_for_cmd, NewState};
 	{{ok, _BufferedNicks}, _, "error"} ->
@@ -549,7 +562,11 @@ wait_for_cmd({route, From, _To, {xmlelement, "presence", Attrs, Els} = El}, Stat
 			send_reply(ReplyCode, [Channel, ErrorDescription], State),
 
 			NewJoiningDict = ?DICT:erase(FromRoom, State#state.joining),
-			State#state{joining = NewJoiningDict};
+			NewSeen = update_seen(Channel,
+					      fun(D) ->
+						      ?DICT:erase(FromNick, D)
+					      end, State#state.seen),
+			State#state{joining = NewJoiningDict, seen = NewSeen};
 		    _ ->
 			?ERROR_MSG("ignoring presence of type ~s from ~s while joining room",
 				   [Type, jlib:jid_to_string(From)]),
@@ -559,12 +576,32 @@ wait_for_cmd({route, From, _To, {xmlelement, "presence", Attrs, Els} = El}, Stat
 	%% Presence in a channel we have already joined
 	{_, {ok, _}, ""} ->
 	    %% Someone enters
-	    send_command(IRCSender, "JOIN", [Channel], State),
-	    {next_state, wait_for_cmd, State};
+	    case get_seen(Channel, FromNick, State#state.seen) of
+		{ok, _Seen} ->
+		    ignore;
+		error ->
+		    send_command(IRCSender, "JOIN", [Channel], State)
+	    end,
+	    NewSeen = update_seen(Channel,
+				  fun(D) ->
+					  ?DICT:store(FromNick,
+						      #seen{status = Status, show = Show},
+						      D)
+				  end, State#state.seen),
+	    {next_state, wait_for_cmd, State#state{seen = NewSeen}};
 	{_, {ok, _}, _} ->
 	    %% Someone leaves
-	    send_command(IRCSender, "PART", [Channel], State),
-	    {next_state, wait_for_cmd, State};
+	    case get_seen(Channel, FromNick, State#state.seen) of
+		{ok, _Seen} ->
+		    NewSeen = update_seen(Channel,
+					  fun(D) ->
+						  ?DICT:erase(FromNick, D)
+					  end, State#state.seen),
+		    send_command(IRCSender, "PART", [Channel], State),
+		    {next_state, wait_for_cmd, State#state{seen = NewSeen}};
+		error ->
+		    ignore
+	    end;
 	_ ->
 	    ?INFO_MSG("unexpected presence from ~s", [jlib:jid_to_string(From)]),
 	    {next_state, wait_for_cmd, State}
@@ -866,6 +903,28 @@ find_el(Name, NS, [{xmlelement, N, Attrs, _} = El|Els]) ->
     end;
 find_el(_, _, []) ->
     nothing.
+
+update_seen(Channel, F, Seen) ->
+    OldChannelSeen =
+	case ?DICT:find(Channel, Seen) of
+	    {ok, D} -> D;
+	    error -> ?DICT:new()
+	end,
+    NewChannelSeen = F(OldChannelSeen),
+    case ?DICT:size(NewChannelSeen) of
+	0 ->
+	    ?DICT:erase(Channel, Seen);
+	_ ->
+	    ?DICT:store(Channel, NewChannelSeen, Seen)
+    end.
+
+get_seen(Channel, Nick, Seen) ->
+    case ?DICT:find(Channel, Seen) of
+	{ok, ChannelSeen} ->
+	    ?DICT:find(ChannelSeen, Nick);
+	error ->
+	    error
+    end.
 
 channel_to_jid([$#|Channel], State) ->
     channel_to_jid(Channel, State);
