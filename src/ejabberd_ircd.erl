@@ -564,7 +564,8 @@ wait_for_cmd({line, #line{command = "LIST"}}, #state{nick = Nick} = State) ->
     NewState = State#state{outgoing_requests = ?DICT:append(Id, F, State#state.outgoing_requests)},
     {next_state, wait_for_cmd, NewState};
 
-wait_for_cmd({line, #line{command = "WHO", params = [Channel]}}, #state{nick = MyNick} = State) ->
+wait_for_cmd({line, #line{command = "WHO", params = [[$# | Channel1] = Channel]}},
+	     #state{nick = MyNick} = State) ->
     case ?DICT:find(Channel, State#state.seen) of
 	{ok, ChannelSeen} ->
 	    ?DICT:fold(fun(Nick, #seen{show = Show, role = Role}, _) ->
@@ -588,7 +589,7 @@ wait_for_cmd({line, #line{command = "WHO", params = [Channel]}}, #state{nick = M
 			       send_reply('RPL_WHOREPLY', [MyNick,
 							   Channel,
 							   JID#jid.resource,
-							   JID#jid.server,
+							   Channel1,
 							   JID#jid.server,
 							   Nick,
 							   Flags,
@@ -1182,6 +1183,28 @@ find_el(Name, NS, [{xmlelement, N, Attrs, _} = El|Els]) ->
     end;
 find_el(_, _, []) ->
     nothing.
+
+update_seen(Channel, F, Seen) ->
+    OldChannelSeen =
+	case ?DICT:find(Channel, Seen) of
+	    {ok, D} -> D;
+	    error -> ?DICT:new()
+	end,
+    NewChannelSeen = F(OldChannelSeen),
+    case ?DICT:size(NewChannelSeen) of
+	0 ->
+	    ?DICT:erase(Channel, Seen);
+	_ ->
+	    ?DICT:store(Channel, NewChannelSeen, Seen)
+    end.
+
+get_seen(Channel, Nick, Seen) ->
+    case ?DICT:find(Channel, Seen) of
+	{ok, ChannelSeen} ->
+	    ?DICT:find(Nick, ChannelSeen);
+	error ->
+	    error
+    end.
 
 %as the name says this delivers the jid of a channel name. 
 % to #foo it returns foo@example.net
