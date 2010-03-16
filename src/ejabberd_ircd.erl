@@ -52,7 +52,10 @@
 		channels_to_jids = ?DICT:new(),
 		jids_to_channels = ?DICT:new(),
 		%% maps /iq/@id to {ReplyFun/1, expire timestamp
-		outgoing_requests = ?DICT:new()
+		outgoing_requests = ?DICT:new(),
+		%% maps to #seen per channel
+		seen = ?DICT:new(),
+		quit_msg
 	       }).
 -record(channel, {participants = [],
 		  topic = ""}).
@@ -152,12 +155,12 @@ handle_info({tcp, _Socket, Line}, StateName, StateData) ->
     Parsed = parse_line(DecodedLine),
     ?MODULE:StateName({line, Parsed}, StateData);
 handle_info({tcp_closed, _}, _StateName, StateData) ->
-    {stop, normal, StateData};
+    {stop, normal, StateData#state{quit_msg = "Connection closed"}};
 handle_info({route, _, _, _} = Event, StateName, StateData) ->
     ?MODULE:StateName(Event, StateData);
 handle_info(replaced, _StateName, #state{nick = Nick} = StateData) ->
     send_line("KILL " ++ Nick ++ " (Replaced)", StateData),
-    {stop, replaced, StateData};
+    {stop, normal, StateData#state{quit_msg = "Session replaced"}};
 handle_info(Info, StateName, StateData) ->
     ?ERROR_MSG("Unexpected info: ~p", [Info]),
     {next_state, StateName, StateData}.
@@ -174,26 +177,31 @@ code_change(_OldVsn, StateName, StateData, _Extra) ->
     {ok, StateName, StateData}.
 terminate(_Reason, _StateName, #state{socket = Socket, sockmod = SockMod,
 				      sid = SID, nick = Nick,
-				      joined = JoinedDict} = State) ->
+				      quit_msg = [_ | _] = QuitMsg} = State) ->
     ?INFO_MSG("closing IRC connection for ~p", [Nick]),
     case SID of
 	none ->
 	    ok;
 	_ ->
 	    Packet = {xmlelement, "presence",
-		      [{"type", "unavailable"}], []},
+		      [{"type", "unavailable"}],
+		      [
+		       {xmlelement, "status", [],
+			[{xmlcdata, QuitMsg}]}
+		      ]},
 	    FromJID = user_jid(State),
-	    ?DICT:map(fun(ChannelJID, _ChannelData) ->
-			      ejabberd_router:route(FromJID, ChannelJID, Packet)
-		      end, JoinedDict),
+	    foreach_channel(fun(ChannelJID, _ChannelData) ->
+				    ejabberd_router:route(FromJID, ChannelJID, Packet)
+			    end, State),
 	    ejabberd_sm:close_session_unset_presence(SID, FromJID#jid.user,
 						     FromJID#jid.server, FromJID#jid.resource,
-						     "Logged out")
+						     QuitMsg)
     end,
     gen_tcp = SockMod,
     ok = gen_tcp:close(Socket),
-    ok.
-
+    ok;
+terminate(Reason, StateName, StateData) ->
+    terminate(Reason, StateName, StateData#state{quit_msg = "Session terminated"}).
 
 wait_for_login({line, #line{command = "WEBIRC", params = [Password, _, _, _]}}, State) ->
     ?DEBUG("in wait_for_login", []),
@@ -627,9 +635,8 @@ wait_for_cmd({line, #line{command = "AWAY", params = [AwayMsg]}}, #state{nick = 
     send_reply('RPL_NOWAWAY', [Nick, "Presence sent: " ++ AwayMsg], State),
     {next_state, wait_for_cmd, State};
 
-wait_for_cmd({line, #line{command = "QUIT"}}, State) ->
-    %% quit message is ignored for now
-    {stop, normal, State};
+wait_for_cmd({line, #line{command = "QUIT", params = [QuitMsg]}}, State) ->
+    {stop, normal, State#state{quit_msg = QuitMsg}};
 
 wait_for_cmd({line, #line{command = Unknown, params = Params} = Line}, State) ->
     ?INFO_MSG("Unknown command: ~p", [Line]),
