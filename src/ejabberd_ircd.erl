@@ -451,11 +451,10 @@ wait_for_cmd({line, #line{command = "LIST"}}, #state{nick = Nick} = State) ->
     NewState = State#state{outgoing_requests = ?DICT:append(Id, F, State#state.outgoing_requests)},
     {next_state, wait_for_cmd, NewState};
 
-wait_for_cmd({line, #line{command = "WHO", params = [Channel]}}, State) ->
+wait_for_cmd({line, #line{command = "WHO", params = [Channel]}}, #state{nick = MyNick} = State) ->
     case ?DICT:find(Channel, State#state.seen) of
 	{ok, ChannelSeen} ->
 	    ?DICT:fold(fun(Nick, #seen{show = Show, role = Role}, _) ->
-			       %% "<channel> <user> <host> <server> <nick> <H|G>[*][@|+] :<hopcount> <real name>"
 			       Away = case Show of
 					  "" -> false;
 					  "chat" -> false;
@@ -472,7 +471,10 @@ wait_for_cmd({line, #line{command = "WHO", params = [Channel]}}, State) ->
 				       _ -> ""
 				   end,
 			       JID = channel_nick_to_jid(Nick, Channel, State),
-			       send_reply('RPL_WHOREPLY', [JID#jid.resource,
+			       %% "<channel> <user> <host> <server> <nick> <H|G>[*][@|+] :<hopcount> <real name>"
+			       send_reply('RPL_WHOREPLY', [MyNick,
+							   Channel,
+							   JID#jid.resource,
 							   JID#jid.server,
 							   JID#jid.server,
 							   Nick,
