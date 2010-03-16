@@ -703,7 +703,14 @@ wait_for_cmd({route, From, _To, {xmlelement, "presence", Attrs, Els} = El}, Stat
 		_ -> [{FromNick, NewRole} | BufferedNicks]
 	    end,
 	    ?DEBUG("~s is present in ~s.  we now have ~p.",
-		   		[FromNick, Channel, NewBufferedNicks]),
+		   [FromNick, Channel, NewBufferedNicks]),
+	    NewSeen = update_seen(Channel,
+				  fun(D) ->
+					  ?DICT:store(FromNick,
+						      #seen{status = Status, show = Show,
+							    role = Role},
+						      D)
+				  end, State#state.seen),
 	    %% We receive our own presence last.  XXX: there
 	    %% are some status codes here.  See XEP-0045,
 	    %% section 7.1.3.
@@ -723,13 +730,6 @@ wait_for_cmd({route, From, _To, {xmlelement, "presence", Attrs, Els} = El}, Stat
 			% there iss a nick joining a channel, or a nick who is present in a channel 
                         % we have to make an entry  
 			NewJoining = ?DICT:store(FromRoom, #channel{participants = NewBufferedNicks}, State#state.joining),
-			NewSeen = update_seen(Channel,
-					      fun(D) ->
-						      ?DICT:store(FromNick,
-								  #seen{status = Status, show = Show,
-									role = Role},
-								  D)
-					      end, State#state.seen),
 			State#state{joining = NewJoining, seen = NewSeen}
 		end,
 	    {next_state, wait_for_cmd, NewState};
@@ -831,9 +831,23 @@ wait_for_cmd({route, From, _To, {xmlelement, "presence", Attrs, Els} = El}, Stat
 			State#state.joined),
 			State#state{joined = NewJoinedDict};
 		{_, _} ->
-			% something else happened   
-	   		send_command(IRCSender, "PART", [Channel], State),
-			State
+			     %% Someone leaves
+			     case get_seen(Channel, FromNick, State#state.seen) of
+				 {ok, _Seen} ->
+				     NewSeen = update_seen(Channel,
+							   fun(D) ->
+								   ?DICT:erase(FromNick, D)
+							   end, State#state.seen),
+				     PartMsg = if
+						   is_list(Status) -> remove_line_breaks(Status);
+						   true -> ""
+					       end,
+				     send_command(IRCSender, "PART", [Channel, PartMsg], State),
+				     State#state{seen = NewSeen};
+				 error ->
+				     State
+			     end
+	    end;
 	   end,
 	   {next_state, wait_for_cmd, NewState};
 	{_, {ok, ChannelData}, _} ->
@@ -1310,6 +1324,15 @@ translate_action(Msg) ->
 	_ ->
 	    Msg
     end.
+
+remove_line_breaks(S) ->
+    lists:map(fun($\r) ->
+		      $ ;
+		 ($\n) ->
+		      $ ;
+		 (C) ->
+		      C
+	      end, S).
 
 parse_error({xmlelement, "error", _ErrorAttrs, ErrorEls} = ErrorEl) ->
     ErrorTextEl = xml:get_subtag(ErrorEl, "text"),
