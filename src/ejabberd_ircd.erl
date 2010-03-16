@@ -54,7 +54,7 @@
 -record(channel, {participants = [],
 		  topic = ""}).
 
--record(seen, {status, show}).
+-record(seen, {status, show, role}).
 
 -record(line, {prefix, command, params}).
 
@@ -451,6 +451,40 @@ wait_for_cmd({line, #line{command = "LIST"}}, #state{nick = Nick} = State) ->
     NewState = State#state{outgoing_requests = ?DICT:append(Id, F, State#state.outgoing_requests)},
     {next_state, wait_for_cmd, NewState};
 
+wait_for_cmd({line, #line{command = "WHO", params = [Channel]}}, State) ->
+    case ?DICT:find(Channel, State#state.seen) of
+	{ok, ChannelSeen} ->
+	    ?DICT:fold(fun(Nick, #seen{show = Show, role = Role}, _) ->
+			       %% "<channel> <user> <host> <server> <nick> <H|G>[*][@|+] :<hopcount> <real name>"
+			       Away = case Show of
+					  "" -> false;
+					  "chat" -> false;
+					  _ -> true
+				      end,
+			       Flags =
+				   if
+				       Away -> "G";
+				       true -> "H"
+				   end ++
+				   case Role of
+				       "moderator" -> "@";
+				       "participant" -> "+";
+				       _ -> ""
+				   end,
+			       JID = channel_nick_to_jid(Nick, Channel, State),
+			       send_reply('RPL_WHOREPLY', [JID#jid.resource,
+							   JID#jid.server,
+							   JID#jid.server,
+							   Nick,
+							   Flags,
+							   "0 " ++ Nick], State)
+		       end, ok, ChannelSeen),
+	    send_reply('RPL_ENDOFWHO', ["End of /WHO list"], State);
+	error ->
+	    send_reply('ERR_CANNOTSENDTOCHAN', [Channel, "Cannot send to channel"], State)
+    end,
+    {next_state, wait_for_cmd, State};
+
 wait_for_cmd({line, #line{command = "QUIT"}}, State) ->
     %% quit message is ignored for now
     {stop, normal, State};
@@ -468,6 +502,12 @@ wait_for_cmd({route, From, _To, {xmlelement, "presence", Attrs, Els} = El}, Stat
 
     Status = xml:get_path_s(El, [{elem, "status"}, cdata]),
     Show = xml:get_path_s(El, [{elem, "show"}, cdata]),
+    Role = case find_el("x", ?NS_MUC_USER, Els) of
+	       nothing ->
+		   "";
+	       XMucEl ->
+		   xml:get_path_s(XMucEl, [{elem, "item"}, {attr, "role"}])
+	   end,
 
     Channel = jid_to_channel(From, State),
     MyNick = State#state.nick,
@@ -487,13 +527,7 @@ wait_for_cmd({route, From, _To, {xmlelement, "presence", Attrs, Els} = El}, Stat
 		    ok
 	    end,
 
-	    NewRole = case find_el("x", ?NS_MUC_USER, Els) of
-			  nothing ->
-			      "";
-			  XMucEl ->
-			      xml:get_path_s(XMucEl, [{elem, "item"}, {attr, "role"}])
-		      end,
-	    NewBufferedNicks = [{FromNick, NewRole} | BufferedNicks],
+	    NewBufferedNicks = [{FromNick, Role} | BufferedNicks],
 	    ?DEBUG("~s is present in ~s.  we now have ~p.",
 		   [FromNick, Channel, NewBufferedNicks]),
 	    %% We receive our own presence last.  XXX: there
@@ -507,8 +541,8 @@ wait_for_cmd({route, From, _To, {xmlelement, "presence", Attrs, Els} = El}, Stat
 				    Channel,
 				    lists:append(
 				      lists:map(
-					fun({Nick, Role}) ->
-						case Role of
+					fun({Nick, Role1}) ->
+						case Role1 of
 						    "moderator" ->
 							"@";
 						    "participant" ->
@@ -532,7 +566,8 @@ wait_for_cmd({route, From, _To, {xmlelement, "presence", Attrs, Els} = El}, Stat
 			NewSeen = update_seen(Channel,
 					      fun(D) ->
 						      ?DICT:store(FromNick,
-								  #seen{status = Status, show = Show},
+								  #seen{status = Status, show = Show,
+									role = Role},
 								  D)
 					      end, State#state.seen),
 			State#state{joining = NewJoining, seen = NewSeen}
@@ -585,7 +620,8 @@ wait_for_cmd({route, From, _To, {xmlelement, "presence", Attrs, Els} = El}, Stat
 	    NewSeen = update_seen(Channel,
 				  fun(D) ->
 					  ?DICT:store(FromNick,
-						      #seen{status = Status, show = Show},
+						      #seen{status = Status, show = Show,
+							    role = Role},
 						      D)
 				  end, State#state.seen),
 	    {next_state, wait_for_cmd, State#state{seen = NewSeen}};
@@ -844,6 +880,8 @@ send_reply(Reply, Params, State) ->
 		     "473";
 		 'ERR_NOSUCHSERVER' ->
 		     "402";
+		 'ERR_CANNOTSENDTOCHAN' ->
+		     "404";
 		 'RPL_UMODEIS' ->
 		     "221";
 		 'RPL_CHANNELMODEIS' ->
@@ -871,7 +909,11 @@ send_reply(Reply, Params, State) ->
 		 'RPL_LIST' ->
 		     "322";
 		 'RPL_LISTEND' ->
-		     "323"
+		     "323";
+		 'RPL_WHOREPLY' ->
+		     "352";
+		 'RPL_ENDOFWHO' ->
+		     "315"
 	     end,
     send_text_command("", Number, Params, State).
 
