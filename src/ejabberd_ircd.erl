@@ -494,7 +494,6 @@ wait_for_cmd({line, #line{command = "LIST"}}, #state{nick = Nick} = State) ->
 						      send_reply('RPL_LIST', [Nick, Channel, "0", ""], State2);
 						  {{value, JID}, {value, Name}} ->
 						      Channel = jid_to_channel(jlib:string_to_jid(JID), State2),
-						      %% TODO: iconv(Name)
 						      send_reply('RPL_LIST', [Nick, Channel, "0", Name], State2);
 						  _ -> ok
 					      end
