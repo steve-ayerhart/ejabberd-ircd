@@ -143,6 +143,9 @@ handle_info({tcp_closed, _}, _StateName, StateData) ->
     {stop, normal, StateData};
 handle_info({route, _, _, _} = Event, StateName, StateData) ->
     ?MODULE:StateName(Event, StateData);
+handle_info(replaced, _StateName, #state{nick = Nick} = StateData) ->
+    send_line("KILL " ++ Nick ++ " (Replaced)", StateData),
+    {stop, replaced, StateData};
 handle_info(Info, StateName, StateData) ->
     ?ERROR_MSG("Unexpected info: ~p", [Info]),
     {next_state, StateName, StateData}.
