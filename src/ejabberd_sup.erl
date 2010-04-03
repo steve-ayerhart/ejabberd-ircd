@@ -99,6 +99,16 @@ init([]) ->
 	 infinity,
 	 supervisor,
 	 [ejabberd_tmp_sup]},
+<<<<<<< HEAD
+=======
+    IRCDSupervisor =
+	{ejabberd_ircd_sup,
+	 {ejabberd_tmp_sup, start_link, [ejabberd_ircd_sup, ejabberd_ircd]},
+	 permanent,
+	 infinity,
+	 supervisor,
+	 [ejabberd_tmp_sup]},
+>>>>>>> 8c786b71f5da79cff124d85073ffdd6558b16cc0
     C2SSupervisor =
 	{ejabberd_c2s_sup,
 	 {ejabberd_tmp_sup, start_link, [ejabberd_c2s_sup, ejabberd_c2s]},
@@ -162,6 +172,7 @@ init([]) ->
 	 infinity,
 	 supervisor,
 	 [ejabberd_tmp_sup]},
+<<<<<<< HEAD
     IRCDSupervisor =
 	{ejabberd_ircd_sup,
 	 {ejabberd_tmp_sup, start_link, [ejabberd_ircd_sup, ejabberd_ircd]},
@@ -169,6 +180,8 @@ init([]) ->
 	 infinity,
 	 supervisor,
 	 [ejabberd_tmp_sup]},
+=======
+>>>>>>> 8c786b71f5da79cff124d85073ffdd6558b16cc0
     {ok, {{one_for_one, 10, 1},
 	  [Hooks,
 	   NodeGroups,
@@ -178,6 +191,10 @@ init([]) ->
 	   S2S,
 	   Local,
 	   ReceiverSupervisor,
+<<<<<<< HEAD
+=======
+	   IRCDSupervisor,
+>>>>>>> 8c786b71f5da79cff124d85073ffdd6558b16cc0
 	   C2SSupervisor,
 	   S2SInSupervisor,
 	   S2SOutSupervisor,
@@ -186,8 +203,12 @@ init([]) ->
 	   HTTPPollSupervisor,
 	   IQSupervisor,
 	   FrontendSocketSupervisor,
+<<<<<<< HEAD
 	   Listener,
 	   IRCDSupervisor]}}.
 
+=======
+	   Listener]}}.
+>>>>>>> 8c786b71f5da79cff124d85073ffdd6558b16cc0
 
 
