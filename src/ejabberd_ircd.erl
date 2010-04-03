@@ -535,43 +535,6 @@ wait_for_cmd({line, #line{command = "NICK", params = [NewNick | _]}}, State) ->
 	    {next_state, wait_for_cmd, State}
     end;
 
-wait_for_cmd({line, #line{command = "LIST"}}, #state{nick = Nick} = State) ->
-    Id = randoms:get_string(),
-    ejabberd_router:route(user_jid(State), jlib:make_jid("", State#state.muc_host, ""),
-			  {xmlelement, "iq", [{"type", "get"},
-					      {"id", Id}],
-			   [{xmlelement, "query",
-			     [{"xmlns", ?NS_DISCO_ITEMS}], []}
-			   ]}),
-    F = fun(Reply, State2) ->
-		Type = xml:get_tag_attr_s("type", Reply),
-		Xmlns = xml:get_path_s(Reply, [{elem, "query"}, {attr, "xmlns"}]),
-		case {Type, Xmlns} of
-		    {"result", ?NS_DISCO_ITEMS} ->
-			{xmlelement, _, _, Items} = xml:get_subtag(Reply, "query"),
-			send_reply('RPL_LISTSTART', [Nick, "N Title"], State2),
-			lists:foreach(fun({xmlelement, "item", _, _} = El) ->
-					      case {xml:get_tag_attr("jid", El),
-						    xml:get_tag_attr("name", El)} of
-						  {{value, JID}, false} ->
-						      Channel = jid_to_channel(jlib:string_to_jid(JID), State2),
-						      send_reply('RPL_LIST', [Nick, Channel, "0", ""], State2);
-						  {{value, JID}, {value, Name}} ->
-						      Channel = jid_to_channel(jlib:string_to_jid(JID), State2),
-						      %% TODO: iconv(Name)
-						      send_reply('RPL_LIST', [Nick, Channel, "0", Name], State2);
-						  _ -> ok
-					      end
-				      end, Items),
-			send_reply('RPL_LISTEND', [Nick, "End of discovery result"], State2);
-		    _ ->
-			send_reply('ERR_NOSUCHSERVER', ["Invalid response"], State2)
-		end,
-		{next_state, wait_for_cmd, State2}
-	end,
-    NewState = State#state{outgoing_requests = ?DICT:append(Id, F, State#state.outgoing_requests)},
-    {next_state, wait_for_cmd, NewState};
-
 wait_for_cmd({line, #line{command = "WHO", params = [[$# | Channel1] = Channel]}},
 	     #state{nick = MyNick} = State) ->
     case ?DICT:find(Channel, State#state.seen) of
@@ -645,11 +608,11 @@ wait_for_cmd({line, #line{command = Unknown, params = Params} = Line}, State) ->
     {next_state, wait_for_cmd, State};
 
 wait_for_cmd({route, From, _To, {xmlelement, "presence", Attrs, Els} = El}, State) ->
-    % type can get "error"  or ""
+    %% type can get "error"  or ""
     Type = xml:get_attr_s("type", Attrs),
-    % FromRoom is chatroom@conference.example.net as jabber id
+    %% FromRoom is chatroom@conference.example.net as jabber id
     FromRoom = jlib:jid_remove_resource(From),
-    % The Nickname 
+    %% The Nickname 
     FromNick = From#jid.resource,
 
     Status = xml:get_path_s(El, [{elem, "status"}, cdata]),
@@ -661,23 +624,23 @@ wait_for_cmd({route, From, _To, {xmlelement, "presence", Attrs, Els} = El}, Stat
 		   xml:get_path_s(XMucEl, [{elem, "item"}, {attr, "role"}])
 	   end,
 
-    % returns the channel "#chatrom"
+    %% returns the channel "#chatrom"
     Channel = jid_to_channel(From, State),
-    % this is my current nick or the one I want to have
+    %% this is my current nick or the one I want to have
     MyNick = State#state.nick,
-    % generates something like nick!nick@#chatroom
+    %% generates something like nick!nick@#chatroom
     IRCSender = make_irc_sender(FromNick, FromRoom, State),
 
-    % some debug code
+    %% some debug code
     %send_reply('RPL_MOTD', [MyNick, "Got Presence "++FromNick++"."], State),
 
-    % make a dict find for the channel in state joining 
+    %% make a dict find for the channel in state joining 
     Joining = ?DICT:find(FromRoom, State#state.joining),
-    % and in state joined
+    %% and in state joined
     Joined = ?DICT:find(FromRoom, State#state.joined),
     case {Joining, Joined, Type} of
 	{{ok, ChannelData}, _, ""} ->
-	   BufferedNicks=ChannelData#channel.participants,
+	    BufferedNicks=ChannelData#channel.participants,
 	    case BufferedNicks of
 		[] ->
 		    %% If this is the first presence, tell the
@@ -688,20 +651,12 @@ wait_for_cmd({route, From, _To, {xmlelement, "presence", Attrs, Els} = El}, Stat
 		    ok
 	    end,
 	    
-	    % NewRole enthält /presence/x/item@role but sometimes ""
-	    NewRole = case find_el("x", ?NS_MUC_USER, Els) of
-			  nothing ->
-			      "";
-			  XMucEl ->
-			      xml:get_path_s(XMucEl, [{elem, "item"}, {attr, "role"}])
-		      end,
-	    
-	    %attach the user with the role to our BufferedNicks list
-	    % but only if the presence has a role 
-	    NewBufferedNicks = case NewRole of 
-		"" -> BufferedNicks;
-		_ -> [{FromNick, NewRole} | BufferedNicks]
-	    end,
+	    %% attach the user with the role to our BufferedNicks list
+	    %% but only if the presence has a role 
+	    NewBufferedNicks = case Role of 
+				   "" -> BufferedNicks;
+				   _ -> [{FromNick, Role} | BufferedNicks]
+			       end,
 	    ?DEBUG("~s is present in ~s.  we now have ~p.",
 		   [FromNick, Channel, NewBufferedNicks]),
 	    NewSeen = update_seen(Channel,
@@ -715,26 +670,26 @@ wait_for_cmd({route, From, _To, {xmlelement, "presence", Attrs, Els} = El}, Stat
 	    %% are some status codes here.  See XEP-0045,
 	    %% section 7.1.3.
 	    NewState =
-		case {FromNick, NewRole} of
+		case {FromNick, Role} of
 		    % this is a presence without a role we have to do nothing yet 
-		   {MyNick, ""} -> State;
+		    {MyNick, ""} -> State;
 		    {MyNick, _} ->
 			NewJoiningDict = ?DICT:erase(FromRoom, State#state.joining),
 			NewChannelData = #channel{participants = NewBufferedNicks},
 			NewJoinedDict = ?DICT:store(FromRoom, NewChannelData, State#state.joined),
 			MyState=State#state{joining = NewJoiningDict,
-                                    joined = NewJoinedDict},
+					    joined = NewJoinedDict},
 		        reply_names(Channel, NewChannelData, MyState),
 			MyState;
 		    {_, _} ->
-			% there iss a nick joining a channel, or a nick who is present in a channel 
-                        % we have to make an entry  
+			%% there iss a nick joining a channel, or a nick who is present in a channel 
+                        %% we have to make an entry  
 			NewJoining = ?DICT:store(FromRoom, #channel{participants = NewBufferedNicks}, State#state.joining),
 			State#state{joining = NewJoining, seen = NewSeen}
 		end,
 	    {next_state, wait_for_cmd, NewState};
 	{{ok, _ChannelData}, _, "error"} ->
-	   %BufferedNicks=ChannelData#channel.participants,
+	    %BufferedNicks=ChannelData#channel.participants,
 	    NewState =
 		case FromNick of
 		    MyNick ->
@@ -773,33 +728,30 @@ wait_for_cmd({route, From, _To, {xmlelement, "presence", Attrs, Els} = El}, Stat
 	    %% Someone enters
 	    % make a NewBufferedNicks  
             % do not send JOIN if this is me
-	    NewState=case FromNick of 
-		MyNick ->
+	    NewState =
+		case FromNick of 
+		    MyNick ->
 			State; 
-		_ -> 
-	    	      MyRole = case find_el("x", ?NS_MUC_USER, Els) of
-			  nothing ->
-			      "";
-			  XMucEl ->
-			      xml:get_path_s(XMucEl, [{elem, "item"}, {attr, "role"}])
-		      	end,
-			NewBufferedNicks=[{FromNick, MyRole}|BufferedNicks],
-			NewJoinedDict = ?DICT:update(FromRoom, 
-				fun(MyChannelData) ->
-					MyChannelData#channel{participants=NewBufferedNicks}
-				end,
-			State#state.joined),
+		    _ -> 
+			NewBufferedNicks=[{FromNick, Role} | BufferedNicks],
+			NewJoinedDict = 
+			    ?DICT:update(FromRoom, 
+					 fun(MyChannelData) ->
+						 MyChannelData#channel{participants = NewBufferedNicks}
+					 end,
+					 State#state.joined),
 	    		send_command(IRCSender, "JOIN", [Channel], State),
 			State#state{joined=NewJoinedDict}
 		end,
 	    {next_state, wait_for_cmd, NewState};
 	{_, {ok, _}, "error"} ->
-	    % Some error occured this is maybe a nickname collision
- 	    NewState=case FromNick of 
-		MyNick -> 
+	    %% Some error occured this is maybe a nickname collision
+ 	    NewState =
+		case FromNick of 
+		    MyNick -> 
 	   		send_command(IRCSender, "PART", [Channel], State),
 			part_channels(Channel, State, "Nickname Collision");
-		_ ->
+		    _ ->
 			NewSeen = update_seen(Channel,
 					      fun(D) ->
 						      ?DICT:store(FromNick,
@@ -808,59 +760,60 @@ wait_for_cmd({route, From, _To, {xmlelement, "presence", Attrs, Els} = El}, Stat
 								  D)
 					      end, State#state.seen),
 			State#state{seen = NewSeen}
-	    end,
+		end,
 	    {next_state, wait_for_cmd, NewState};
 	{_, {ok, ChannelData}, "unavailable"} ->
-	   BufferedNicks=ChannelData#channel.participants,
+	    BufferedNicks=ChannelData#channel.participants,
 	    %% Someone leaves or we have a nick change 
-	    % NewRole enthält /presence/x/item@role but sometimes ""
-	   {NewNick, Status} = case find_el("x", ?NS_MUC_USER, Els) of
-		  nothing ->
-		      "";
-		  XMucEl ->
-		      {xml:get_path_s(XMucEl, [{elem, "item"}, {attr, "nick"}]),
-		      xml:get_path_s(XMucEl, [{elem, "status"}, {attr, "code"}])}
-	     	 end,
-	    NewState=case {NewNick, Status} of
-		{MyNick, "303"} -> % yes the nick was changed 
-			NewBufferedNicks=update_nick_in_list(FromNick, NewNick, BufferedNicks),
-			NewJoinedDict = ?DICT:update(FromRoom, 
-				fun(MyChannelData) ->
-					MyChannelData#channel{participants=NewBufferedNicks}
+	    %% NewRole enthält /presence/x/item@role but sometimes ""
+	    {NewNick, Status} = case find_el("x", ?NS_MUC_USER, Els) of
+				    nothing ->
+					"";
+				    XMucEl1 ->
+					{xml:get_path_s(XMucEl1, [{elem, "item"}, {attr, "nick"}]),
+					 xml:get_path_s(XMucEl1, [{elem, "status"}, {attr, "code"}])}
 				end,
-			State#state.joined),
+	    NewState =
+		case {NewNick, Status} of
+		    {MyNick, "303"} -> % yes the nick was changed 
+			NewBufferedNicks=update_nick_in_list(FromNick, NewNick, BufferedNicks),
+			NewJoinedDict =
+			    ?DICT:update(FromRoom, 
+					 fun(MyChannelData) ->
+						 MyChannelData#channel{participants=NewBufferedNicks}
+					 end,
+					 State#state.joined),
 			State#state{joined = NewJoinedDict};
-		{_, _} ->
-			     %% Someone leaves
-			     case get_seen(Channel, FromNick, State#state.seen) of
-				 {ok, _Seen} ->
-				     NewSeen = update_seen(Channel,
-							   fun(D) ->
-								   ?DICT:erase(FromNick, D)
-							   end, State#state.seen),
-				     PartMsg = if
-						   is_list(Status) -> remove_line_breaks(Status);
-						   true -> ""
-					       end,
-				     send_command(IRCSender, "PART", [Channel, PartMsg], State),
-				     State#state{seen = NewSeen};
-				 error ->
-				     State
-			     end
-	    end;
-	   end,
-	   {next_state, wait_for_cmd, NewState};
-	{_, {ok, ChannelData}, _} ->
-	   BufferedNicks=ChannelData#channel.participants,
-	    %% in any other case Someone leaves, too 
-	  NewBufferedNicks=remove_nick_from_list(FromNick, BufferedNicks),
-	   NewJoinedDict = ?DICT:update(FromRoom, 
-		fun(MyChannelData) ->
-			MyChannelData#channel{participants=NewBufferedNicks}
+		    {_, _} ->
+			%% Someone leaves
+			case get_seen(Channel, FromNick, State#state.seen) of
+			    {ok, _Seen} ->
+				NewSeen = update_seen(Channel,
+						      fun(D) ->
+							      ?DICT:erase(FromNick, D)
+						      end, State#state.seen),
+				PartMsg = if
+					      is_list(Status) -> remove_line_breaks(Status);
+					      true -> ""
+					  end,
+				send_command(IRCSender, "PART", [Channel, PartMsg], State),
+				State#state{seen = NewSeen};
+			    error ->
+				State
+			end
 		end,
-	   State#state.joined),
+	    {next_state, wait_for_cmd, NewState};
+	{_, {ok, ChannelData}, _} ->
+	    BufferedNicks=ChannelData#channel.participants,
+	    %% in any other case Someone leaves, too 
+	    NewBufferedNicks=remove_nick_from_list(FromNick, BufferedNicks),
+	    NewJoinedDict = ?DICT:update(FromRoom, 
+					 fun(MyChannelData) ->
+						 MyChannelData#channel{participants=NewBufferedNicks}
+					 end,
+					 State#state.joined),
 	    send_command(IRCSender, "PART", [Channel], State),
-	   {next_state, wait_for_cmd, State#state{joined = NewJoinedDict}};
+	    {next_state, wait_for_cmd, State#state{joined = NewJoinedDict}};
 	_ ->
 	    %% to part channels with nickname collisions
 	    ?INFO_MSG("unexpected presence from ~s", [jlib:jid_to_string(From)]),
@@ -1189,12 +1142,6 @@ send_reply(Reply, Params, State) ->
 		     "375";
 		 'RPL_ENDOFMOTD' ->
 		     "376";
-		 'RPL_LISTSTART' ->
-		     "321";
-		 'RPL_LIST' ->
-		     "322";
-		 'RPL_LISTEND' ->
-		     "323";
 		 'RPL_WHOREPLY' ->
 		     "352";
 		 'RPL_ENDOFWHO' ->
