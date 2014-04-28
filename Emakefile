@@ -1,5 +1,5 @@
 {'src/*', [
 	{outdir, "ebin"},
-	{i,"../../ejabberd-dev/trunk/include"},
+	{i,"../ejabberd/include"},
 	{i,"/usr/lib/ejabberd/include"}
 ]}.
